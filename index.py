@@ -4,9 +4,12 @@ from flask_restful import Resource, Api
 
 import re
 
+###-----REMOVE THIS WHEN IMPORTING DIFFERENT OCR APPROACH----###
 #importing easyocr for reading the scanned VIN number
 import easyocr
 reader = easyocr.Reader(['en'])
+
+###----------------------------------###
 
 # creating the flask app
 app = Flask(__name__)
@@ -17,23 +20,15 @@ api = Api(app)
 # the get, post methods correspond to get and post requests
 # they are automatically mapped by flask_restful.
 # other methods include put, delete, etc.
-class Hello(Resource):
-
-    # corresponds to the GET request.
-    # this function is called whenever there
-    # is a GET request for this resource
-    def get(self):
-
-        return jsonify({'message': 'hello world'})
 
 
 # a resource to get the text from the repair order
 class VINNum(Resource):
     
     def get(self):
-        result = reader.readtext('./Sample.jpg')
+        result = reader.readtext('./Sample.jpg') # this is part of the easyOCR library, remove when implementing other approach
         output_string = ""
-        vin_regex = r'[A-HJ-NPR-Z0-9]{17}'
+        vin_regex = r'[A-HJ-NPR-Z0-9]{17}' #this regular expression allows us to search the output string for characters that fit the VIN number pattern
 
         for (bbox, text, prob) in result:
             output_string += text
