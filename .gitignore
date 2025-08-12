@@ -1,2 +1,3 @@
 VINReaderBackend/
 *.mp4
+.env
