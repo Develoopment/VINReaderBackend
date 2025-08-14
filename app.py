@@ -4,7 +4,6 @@ from flask_restful import Resource, Api
 
 from flask_cors import CORS
 
-import os
 import re
 
 #importing scraper logic
@@ -102,6 +101,10 @@ class GetInfo(Resource):
             print(e)
             return "Error", 503
         
+
+class Hello(Resource):
+    def get(self):
+        return "API Call worked"
 
 # adding the defined resources along with their corresponding urls
 api.add_resource(GetInfo, '/ReadInfo')
