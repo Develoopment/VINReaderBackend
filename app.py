@@ -180,7 +180,7 @@ class DataScrape(Resource)
             except:
                 print("→ No popup found.")
 
-        # Inputs the YMM into the search ar
+        # Inputs the YMM into the search bar
         def perform_top_search(driver, search_term):
             try:
                 # Use RockAuto's main search box selector
@@ -196,11 +196,16 @@ class DataScrape(Resource)
                 time.sleep(3)
             except Exception as e:
                 print(f"[!] Top search failed ({type(e).__name__}): {e}")
-
-        #Finds oil filter brands by elemetn and then also scrapes part number
-        def scrape_oil_filters(driver, brand_filter=None):
+        
+        # ---- Shared helper used by all filter scrapers on a loaded results page ----
+        def _extract_brand_and_part_from_results_page(driver, brand_filter=None):
+            """
+            Assumes the driver is currently on a RockAuto search results page
+            where parts are listed with manufacturer + part number.
+            Returns a list like ["Brand: Part", ...] filtered by brand_filter if provided.
+            """
             try:
-                # Wait for filter part numbers and manufacturers
+                # Wait for part numbers and manufacturers to appear
                 WebDriverWait(driver, 10).until(
                     EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'span.listing-final-partnumber.as-link-if-js'))
                 )
@@ -221,18 +226,42 @@ class DataScrape(Resource)
         
                 for brand_tag, part_tag in zip(brands, parts):
                     brand = brand_tag.get_text(strip=True)
-                    part  = part_tag.get_text(strip=True)
+                    part = part_tag.get_text(strip=True)
                     if brand_filter and not any(b.lower() in brand.lower() for b in brand_filter):
                         continue
                     results.append(f"{brand}: {part}")
         
                 return results
-
+        
+            except Exception as e:
+                print(f"[!] Results extraction failed ({type(e).__name__}): {e}")
+                return []
+        
+        # Finds oil filter brands and part numbers
+        def scrape_oil_filters(driver, brand_filter=None):
+            try:
+                return _extract_brand_and_part_from_results_page(driver, brand_filter)
             except Exception as e:
                 print(f"[!] Oil filter scraping failed ({type(e).__name__}): {e}")
                 return []
-
-# Finds oil types and strips for viscosity
+        
+        # Finds engine air filter brands and part numbers
+        def scrape_engine_air_filters(driver, brand_filter=None):
+            try:
+                return _extract_brand_and_part_from_results_page(driver, brand_filter)
+            except Exception as e:
+                print(f"[!] Engine air filter scraping failed ({type(e).__name__}): {e}")
+                return []
+        
+        # Finds cabin air filter brands and part numbers
+        def scrape_cabin_air_filters(driver, brand_filter=None):
+            try:
+                return _extract_brand_and_part_from_results_page(driver, brand_filter)
+            except Exception as e:
+                print(f"[!] Cabin air filter scraping failed ({type(e).__name__}): {e}")
+                return []
+        
+        # Finds oil types and strips for viscosity
         def scrape_oil_types(driver):
             try:
                 # Wait for oil type spans
@@ -261,8 +290,15 @@ class DataScrape(Resource)
                 print(f"[!] Oil type scraping failed ({type(e).__name__}): {e}")
                 return []
         
-        
-        def scrape_oil_info(driver, search_base, brand_filter=None):
+        def scrape_oil_info(driver, search_base):
+            """
+            Gathers:
+              - oil filters (brands: Mobil, Wix, Fram)
+              - oil types
+              - engine air filters (searches '<YMME> air filter'; brands: Wix, Fram)
+              - cabin air filters (brands: Wix, Fram)
+              - oil capacity (heuristic)
+            """
             try:
                 driver.get("https://www.rockauto.com/")
                 WebDriverWait(driver, 10).until(
@@ -271,12 +307,27 @@ class DataScrape(Resource)
                 time.sleep(2)
                 close_popup(driver)
         
+                # Oil filters — allow Mobil, Wix, Fram
                 perform_top_search(driver, f"{search_base} oil filter")
-                oil_filters = scrape_oil_filters(driver, brand_filter)
+                time.sleep(0.5)
+                oil_filters = scrape_oil_filters(driver, ["Mobil", "Wix", "Fram"])
         
+                # Oil types
                 perform_top_search(driver, f"{search_base} oil")
+                time.sleep(0.5)
                 oil_types = scrape_oil_types(driver)
         
+                # Engine air filters — search uses "air filter" (not "engine air filter"); only Wix, Fram
+                perform_top_search(driver, f"{search_base} air filter")
+                time.sleep(0.5)
+                engine_air_filters = scrape_engine_air_filters(driver, ["Wix", "Fram"])
+        
+                # Cabin air filters — only Wix, Fram
+                perform_top_search(driver, f"{search_base} cabin air filter")
+                time.sleep(0.5)
+                cabin_air_filters = scrape_cabin_air_filters(driver, ["Wix", "Fram"])
+        
+                # Capacity heuristic (unchanged)
                 oil_capacity_estimates = {
                     '1.4l l4': '4.0 quarts',
                     '1.8l l4': '4.4 quarts',
@@ -289,17 +340,26 @@ class DataScrape(Resource)
                     engine_key = engine_key.replace('4l', 'l4')
                 oil_capacity = oil_capacity_estimates.get(engine_key, 'Unknown')
         
-                return { 'oil_filters': oil_filters, 'oil_types': oil_types, 'oil_capacity': oil_capacity }
+                return {
+                    'oil_filters': oil_filters,
+                    'oil_types': oil_types,
+                    'engine_air_filters': engine_air_filters,
+                    'cabin_air_filters': cabin_air_filters,
+                    'oil_capacity': oil_capacity
+                }
         
             except Exception as e:
-                print(f"[!] Failed to scrape oil info ({type(e).__name__}): {e}")
-                return { 'oil_filters': [], 'oil_types': [], 'oil_capacity': 'Unknown' }
-
-
+                print(f"[!] Failed to scrape info ({type(e).__name__}): {e}")
+                return {
+                    'oil_filters': [],
+                    'oil_types': [],
+                    'engine_air_filters': [],
+                    'cabin_air_filters': [],
+                    'oil_capacity': 'Unknown'
+                }
+        
         def main():
             print("Enter vehicle info (e.g. 2020 Toyota Corolla 1.8L L4). Type 'done' when finished.")
-            brand_input = input("Brands to include (comma-separated) or Enter for all: ").strip()
-            brand_filter = [b.strip() for b in brand_input.split(',')] if brand_input else None
         
             vehicles = []
             while True:
@@ -316,24 +376,44 @@ class DataScrape(Resource)
             for y, mk, md, eng in vehicles:
                 desc = f"{y} {mk} {md} {eng}"
                 print(f"\n=== {desc} ===")
-                data = scrape_oil_info(driver, desc, brand_filter)
+                data = scrape_oil_info(driver, desc)
+        
                 print("Oil Filters:")
                 if data['oil_filters']:
                     for f in data['oil_filters']:
                         print(' -', f)
                 else:
                     print(' (none found)')
+        
                 print("Oil Types:")
                 if data['oil_types']:
                     for o in data['oil_types']:
                         print(' -', o)
                 else:
                     print(' (none found)')
+        
+                print("Engine Air Filters (Wix/Fram only):")
+                if data['engine_air_filters']:
+                    for f in data['engine_air_filters']:
+                        print(' -', f)
+                else:
+                    print(' (none found)')
+        
+                print("Cabin Air Filters (Wix/Fram only):")
+                if data['cabin_air_filters']:
+                    for f in data['cabin_air_filters']:
+                        print(' -', f)
+                else:
+                    print(' (none found)')
+        
                 print("Oil Capacity:", data['oil_capacity'])
+        
                 results.append({
                     'Year': y, 'Make': mk, 'Model': md, 'Engine': eng,
                     'Oil Filters': '; '.join(data['oil_filters']),
                     'Oil Types': '; '.join(data['oil_types']),
+                    'Engine Air Filters': '; '.join(data['engine_air_filters']),
+                    'Cabin Air Filters': '; '.join(data['cabin_air_filters']),
                     'Oil Capacity': data['oil_capacity']
                 })
         
@@ -342,14 +422,15 @@ class DataScrape(Resource)
                 mode = 'a' if os.path.isfile('results.csv') else 'w'
                 with open('results.csv', mode, newline='', encoding='utf-8') as f:
                     writer = csv.DictWriter(f, fieldnames=results[0].keys())
-                    if mode=='w': writer.writeheader()
+                    if mode == 'w': writer.writeheader()
                     writer.writerows(results)
                 print("\n Results saved to results.csv")
             else:
                 print("\n No results to save.")
         
-        if __name__=='__main__':
+        if __name__ == '__main__':
             main()
+        
 
 
 # adding the defined resources along with their corresponding urls
