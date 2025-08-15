@@ -5,6 +5,7 @@ from flask_restful import Resource, Api
 from flask_cors import CORS
 
 import re
+import os
 
 #importing scraper logic
 from scrapeRA import runScrape
@@ -100,11 +101,6 @@ class GetInfo(Resource):
         except Exception as e:
             print(e)
             return "Error", 503
-        
-
-class Hello(Resource):
-    def get(self):
-        return "API Call worked"
 
 # adding the defined resources along with their corresponding urls
 api.add_resource(GetInfo, '/ReadInfo')

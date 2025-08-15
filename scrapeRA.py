@@ -11,7 +11,11 @@ import time
 # Initialises browser
 def init_browser():
     options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")  # Use "--headless" if Chrome < 109
+    options.add_argument("--no-sandbox")  # Recommended for server/Docker
     options.add_argument("--start-maximized")
+    options.add_argument("--disable-dev-shm-usage")  # Avoid shared memory issues
+    # Suppress noisy Chrome logs
     # Suppress noisy Chrome logs
     options.add_experimental_option("excludeSwitches", ["enable-logging"])
     options.add_argument("--disable-logging")
