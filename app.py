@@ -7,17 +7,31 @@ from flask_cors import CORS
 import os
 import base64
 import json
+import logging
+
+# --- init logging ---
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("app")
+
+# Resolve paths first so CsvChecker uses the correct CSV location
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+RESULTS_CSV_PATH = os.path.join(APP_DIR, 'results.csv')
+os.environ['RESULTS_CSV'] = RESULTS_CSV_PATH  # must be set BEFORE importing CsvChecker
 
 # importing scraper logic
 from scrapeRA import runScrape
 
-# CSV cache helpers
-from CsvChecker import find_car_in_csv, append_car_to_csv
+# CSV cache helpers (with UPSERT)
+import CsvChecker
+from CsvChecker import find_car_in_csv, upsert_car_data
+
+# Verify CsvChecker sees the path we expect
+log.info(f"CsvChecker.RESULTS_CSV -> {CsvChecker.RESULTS_CSV}")
 
 # need to manually do stuff with the opencv library because the program is unable to resize the image sent from the frontend,
 # so this feeds in the image as a NumPy array image instead of a file path
-import cv2
-import numpy as np
+import cv2  # noqa: F401  (kept if you need cv2 elsewhere)
+import numpy as np  # noqa: F401
 import openai
 
 from dotenv import load_dotenv
@@ -33,11 +47,22 @@ app = Flask(__name__)
 api = Api(app)
 CORS(app, resources={r'/*': {'origins': '*'}})
 
-UPLOAD_FOLDER = 'uploads'
+UPLOAD_FOLDER = os.path.join(APP_DIR, 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# THIS ONE USES THE ACTUAL AI LLM OCR METHOD
-# After reading it out, it then scrapes RockAuto (if not cached)
+def _list_or_semicolon_string(v):
+    """Return list for API response; splits semicolon-delimited strings too."""
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str) and ';' in v:
+        return [s.strip() for s in v.split(';') if s.strip()]
+    return [str(v)] if isinstance(v, (int, float, str)) else []
+
+def _titlecase_column_name(key: str) -> str:
+    return key.replace('_', ' ').title()
+
 class GetInfo(Resource):
     def post(self):
         if 'image' not in request.files:
@@ -52,9 +77,13 @@ class GetInfo(Resource):
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
         # optional brand filters passed by frontend
-        filters_json = request.form.get("filters", "[]")
+        filters_raw = request.form.get("filters", "[]")
+        try:
+            filters = json.loads(filters_raw) if isinstance(filters_raw, str) else (filters_raw or [])
+        except Exception:
+            filters = []
+        log.info(f"Received filters: {filters}")
 
-        # Prompt to extract a single normalized line: "<year> <make> <model> <engine>"
         prompt = """
         You are an OCR and document parsing assistant.
         From this repair order image, extract ONLY the following and respond as a normal string in this format:
@@ -80,76 +109,85 @@ class GetInfo(Resource):
             max_tokens=200
         )
 
-        # Once LLM extracts the year make and model, try CSV cache first
         car_string = (response.choices[0].message.content or "").strip()
         if not car_string:
             return {'error': 'Failed to parse vehicle info from image'}, 422
 
-        # 1) CSV cache lookup
+        log.info(f"OCR car string: {car_string}")
+
+        # 1) CSV cache lookup (whatever fields already known)
+        cached = None
         try:
-            cached = find_car_in_csv(car_string)
-            if cached:
-                # Return cached result immediately
-                return jsonify({
-                    'car': car_string,
-                    'oil_filters': cached.get('Oil Filters', ''),
-                    'oil_types': cached.get('Oil Types', ''),
-                    'oil_capacity': cached.get('Oil Capacity', 'Unknown'),
-                    'source': 'cache'
-                })
+            cached = find_car_in_csv(car_string)  # dict of columns (no 'Car') or False
         except Exception as e:
-            # Cache read error should not prevent scraping; log and continue
-            print(f"[CSV CACHE READ ERROR] {e}")
+            log.error(f"[CSV READ ERROR] {e}")
 
-        # 2) Cache miss → scrape, then append to CSV and return
+        # 2) Scrape fresh data (fill any missing/new fields)
         try:
-            results = runScrape(car_string, filters_json)
-            # Expecting results like:
-            # {
-            #   'oil_filters': ['Brand: Part', ...] or 'Brand: Part; Brand2: Part2',
-            #   'oil_types': ['5w-20', '0w-20'] or '5w-20; 0w-20',
-            #   'oil_capacity': '5.4 quarts'
-            # }
+            scraped = runScrape(car_string, filters)
+            log.info(f"Scraped raw: {scraped}")
 
-            # Normalize outgoing fields to CSV-friendly strings
-            oil_filters = results.get('oil_filters', [])
-            oil_types = results.get('oil_types', [])
-            oil_capacity = results.get('oil_capacity', 'Unknown')
+            if not isinstance(scraped, dict) or not scraped:
+                # If scraper returns nothing, fall back to cache if present
+                if cached:
+                    return jsonify({
+                        'car': car_string,
+                        'oil_filters': _list_or_semicolon_string(cached.get('Oil Filters')),
+                        'oil_types': _list_or_semicolon_string(cached.get('Oil Types')),
+                        'oil_capacity': cached.get('Oil Capacity', 'Unknown'),
+                        'source': 'cache'
+                    })
+                return {'error': 'No results from scraper and no cache available'}, 502
 
-            if isinstance(oil_filters, list):
-                oil_filters_csv = '; '.join(oil_filters)
-            else:
-                oil_filters_csv = str(oil_filters)
+            # Map scraper keys to CSV column names
+            key_map = {
+                'oil_filters': 'Oil Filters',
+                'oil_types': 'Oil Types',
+                'oil_capacity': 'Oil Capacity',
+                'engine_air_filters': 'Engine Air Filters',
+                'cabin_air_filters': 'Cabin Air Filters',
+                'fuel_filters': 'Fuel Filters',
+                'transmission_filters': 'Transmission Filters'
+            }
 
-            if isinstance(oil_types, list):
-                oil_types_csv = '; '.join(oil_types)
-            else:
-                oil_types_csv = str(oil_types)
+            # Prepare values for UPSERT (CSV wants strings; join lists with '; ')
+            to_upsert = {}
+            for k, v in scraped.items():
+                col = key_map.get(k, _titlecase_column_name(k))
+                if isinstance(v, list):
+                    to_upsert[col] = '; '.join(map(str, v))
+                else:
+                    to_upsert[col] = '' if v is None else str(v)
 
-            # Append to CSV (will no-op if duplicate)
-            try:
-                append_car_to_csv(
-                    car_string,
-                    oil_filters=oil_filters_csv,
-                    oil_types=oil_types_csv,
-                    oil_capacity=oil_capacity
-                )
-            except Exception as e:
-                # CSV write error shouldn't block response; log it
-                print(f"[CSV APPEND ERROR] {e}")
+            # 3) Merge into CSV
+            merged = upsert_car_data(car_string, to_upsert)  # returns full row (minus 'Car')
+            log.info(f"Upserted row for {car_string}: {merged}")
 
-            # Return scraped result
+            # Build top-level response compatible with your frontend
+            oil_filters_resp = scraped.get('oil_filters') or merged.get('Oil Filters', '')
+            oil_types_resp = scraped.get('oil_types') or merged.get('Oil Types', '')
+            oil_capacity_resp = scraped.get('oil_capacity', merged.get('Oil Capacity', 'Unknown'))
+
             return jsonify({
                 'car': car_string,
-                'oil_filters': oil_filters if isinstance(oil_filters, list) else oil_filters_csv,
-                'oil_types': oil_types if isinstance(oil_types, list) else oil_types_csv,
-                'oil_capacity': oil_capacity,
-                'source': 'scraped'
+                'oil_filters': _list_or_semicolon_string(oil_filters_resp),
+                'oil_types': _list_or_semicolon_string(oil_types_resp),
+                'oil_capacity': oil_capacity_resp,
+                'source': ('scraped+cache' if cached else 'scraped')
             })
 
         except Exception as e:
-            print(f"[SCRAPE ERROR] {e}")
-            return {'error': 'Scrape failed'}, 503
+            log.error(f"[SCRAPE ERROR] {e}")
+            # If scrape fails, return cache if we have anything
+            if cached:
+                return jsonify({
+                    'car': car_string,
+                    'oil_filters': _list_or_semicolon_string(cached.get('Oil Filters')),
+                    'oil_types': _list_or_semicolon_string(cached.get('Oil Types')),
+                    'oil_capacity': cached.get('Oil Capacity', 'Unknown'),
+                    'source': 'cache'
+                })
+            return {'error': 'Scrape failed and no cache available'}, 503
 
 # adding the defined resources along with their corresponding urls
 api.add_resource(GetInfo, '/ReadInfo')
